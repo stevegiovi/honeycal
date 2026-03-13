@@ -82,25 +82,14 @@ serve(async (req) => {
 
   const action = body.action as UserAction;
 
-  // 3. Load proposal with row lock
+  // 3. Load proposal with row lock (prevents concurrent accept/counter races)
   const { data: proposal, error: loadErr } = await adminClient
     .rpc("load_proposal_for_update", { p_proposal_id: body.proposal_id });
 
-  // Fallback: if RPC doesn't exist, use direct query
-  let lockedProposal: Proposal;
-  if (loadErr) {
-    const { data, error } = await adminClient
-      .from("proposals")
-      .select("*")
-      .eq("id", body.proposal_id)
-      .single();
-    if (error || !data) {
-      return errorResponse(404, "Proposal not found");
-    }
-    lockedProposal = data as Proposal;
-  } else {
-    lockedProposal = proposal as Proposal;
+  if (loadErr || !proposal) {
+    return errorResponse(404, "Proposal not found");
   }
+  const lockedProposal = proposal as Proposal;
 
   // 4. Verify partnership membership
   const roles = await getPartnershipForUser(
