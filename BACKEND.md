@@ -387,16 +387,9 @@ create policy "Users can read partnership proposals"
   on public.proposals for select
   using (public.is_partnership_member(partnership_id));
 
--- Users can insert proposals in their partnership
-create policy "Users can create proposals"
-  on public.proposals for insert
-  with check (
-    public.is_partnership_member(partnership_id)
-    and created_by = auth.uid()
-  );
-
--- Updates to proposals are done via Edge Functions (service_role) to enforce
--- state machine rules. No direct update policy from client.
+-- No client insert policy. Proposals are created via create_proposal RPC (security definer).
+-- No client update policy. State transitions go through proposal-action Edge Function (service_role).
+-- No client delete policy.
 ```
 
 ### 2.5 proposal_versions
@@ -413,18 +406,9 @@ create policy "Users can read proposal versions"
     )
   );
 
--- Users can insert versions (via proposal creation / counter)
-create policy "Users can create proposal versions"
-  on public.proposal_versions for insert
-  with check (
-    created_by = auth.uid()
-    and exists (
-      select 1 from public.proposals p
-      where p.id = proposal_id
-        and public.is_partnership_member(p.partnership_id)
-    )
-  );
-
+-- No client insert policy. Versions are inserted by:
+--   - create_proposal RPC (security definer) for initial proposal
+--   - proposal-action Edge Function (service_role) for counters
 -- Versions are immutable: no update or delete policies.
 ```
 
@@ -889,20 +873,21 @@ Errors:
   424 — both calendar deletes failed (status stays finalized)
 ```
 
-### 6.7 Create-proposal flow
+### 6.7 `create_proposal` (Postgres RPC)
 
-Proposal creation is handled **client-side via Supabase SDK** (not an Edge Function), since it's a straightforward insert within RLS:
+Proposal creation is handled via a **Postgres RPC function** (`security definer`), not direct client inserts. This guarantees atomicity across three tables and keeps mutation paths disciplined — the client never inserts directly into `proposals`, `proposal_versions`, or `proposal_actions`.
 
 ```
-Client-side steps:
-  1. Insert into proposals (partnership_id, created_by, status='proposed', pending_actor_id=partner_id, current_version=1)
-  2. Insert into proposal_versions (proposal_id, version_number=1, created_by, title, location, proposed_start, proposed_end, notes)
-  3. Insert into proposal_actions (proposal_id, actor_id=me, action='proposed', version_number=1)
-
-All three inserts in a single Supabase RPC call or transaction.
+Client calls:
+  supabase.rpc('create_proposal', {
+    p_partnership_id: '...',
+    p_title: 'Dinner at Sushi Roku',
+    p_location: 'Sushi Roku',
+    p_proposed_start: '2026-03-15T19:00:00Z',
+    p_proposed_end: '2026-03-15T21:00:00Z',
+    p_notes: null
+  })
 ```
-
-**Alternative:** If we need atomicity guarantees stronger than what the client SDK provides, wrap this in a Postgres function:
 
 ```sql
 create or replace function public.create_proposal(
@@ -922,7 +907,12 @@ declare
   v_partner_id uuid;
   v_user_id uuid := auth.uid();
 begin
-  -- Get partner ID
+  -- Validate time range
+  if p_proposed_end <= p_proposed_start then
+    raise exception 'proposed_end must be after proposed_start';
+  end if;
+
+  -- Get partner ID (also validates partnership membership)
   select partner_id into v_partner_id
   from public.get_partnership_roles(p_partnership_id, v_user_id);
 
@@ -944,6 +934,51 @@ begin
   values (v_proposal_id, v_user_id, 'proposed', 1);
 
   return v_proposal_id;
+end;
+$$;
+```
+
+### 6.8 `join_partnership` (Postgres RPC)
+
+Partnership joining is also handled via RPC to enforce validation atomically.
+
+```sql
+create or replace function public.join_partnership(p_invite_code text)
+returns uuid
+language plpgsql
+security definer
+as $$
+declare
+  v_partnership_id uuid;
+  v_user_id uuid := auth.uid();
+begin
+  -- Find pending partnership by invite code
+  select id into v_partnership_id
+  from public.partnerships
+  where invite_code = p_invite_code
+    and status = 'pending'
+    and partner_b_id is null
+  for update;
+
+  if v_partnership_id is null then
+    raise exception 'Invalid or expired invite code';
+  end if;
+
+  -- Check user is not already in an active partnership
+  if exists (
+    select 1 from public.partnerships
+    where status != 'dissolved'
+      and (partner_a_id = v_user_id or partner_b_id = v_user_id)
+  ) then
+    raise exception 'Already in a partnership';
+  end if;
+
+  -- Join
+  update public.partnerships
+  set partner_b_id = v_user_id, status = 'active'
+  where id = v_partnership_id;
+
+  return v_partnership_id;
 end;
 $$;
 ```
@@ -1119,3 +1154,165 @@ async function withValidToken(
 ```
 
 All Google API calls go through `withValidToken` to ensure automatic refresh.
+
+---
+
+## Appendix A: Compact Transition Matrix
+
+Every legal state transition in one table. No transition not listed here is allowed.
+
+| # | Current Status | Action | Who | Next Status | `pending_actor_id` After | Side Effects |
+|---|---------------|--------|-----|-------------|--------------------------|--------------|
+| 1 | `proposed` | accept | pending actor | `accepted` | `NULL` | action log: `accepted` |
+| 2 | `proposed` | counter | pending actor | `counter_proposed` | flips to other partner | action log: `countered` + new `proposal_version` |
+| 3 | `proposed` | decline | pending actor | `declined` | `NULL` | action log: `declined` |
+| 4 | `proposed` | withdraw | either partner | `withdrawn` | `NULL` | action log: `withdrawn` |
+| 5 | `counter_proposed` | accept | pending actor | `accepted` | `NULL` | action log: `accepted` |
+| 6 | `counter_proposed` | counter | pending actor | `counter_proposed` | flips to other partner | action log: `countered` + new `proposal_version` |
+| 7 | `counter_proposed` | decline | pending actor | `declined` | `NULL` | action log: `declined` |
+| 8 | `counter_proposed` | withdraw | either partner | `withdrawn` | `NULL` | action log: `withdrawn` |
+| 9 | `accepted` | *(auto-finalize)* | **server only** | `finalized` | `NULL` | action log: `finalized` + write both GCals + `calendar_events` row |
+| 10 | `finalized` | cancel | either partner | `cancelled` | `NULL` | action log: `cancelled` + delete both GCals |
+| 11 | `accepted` | retry_finalize | either partner | `finalized` | `NULL` | re-attempt failed GCal writes |
+| 12 | `finalized` *(partial_failure)* | retry_finalize | either partner | `finalized` | `NULL` | re-attempt failed GCal write |
+| 13 | `finalized` | retry_cancel | either partner | `cancelled` | `NULL` | re-attempt failed GCal delete |
+
+**Terminal states** (no further transitions except retry): `finalized`, `withdrawn`, `declined`, `cancelled`.
+
+**Row 9 is never triggered by the client directly.** It is executed inside the `proposal-action` Edge Function immediately after row 1 or 5 succeeds. The client sends `accept`; the server performs `accept` → `finalize` atomically.
+
+---
+
+## Appendix B: Server-Owned Operations
+
+Every write operation and who owns it.
+
+### Operations that MUST go through Edge Functions (service_role)
+
+| Operation | Edge Function | Why server-only |
+|-----------|--------------|-----------------|
+| Store/update Google tokens | `google-auth-callback` | Tokens are encrypted server-side. Client never sees raw tokens. |
+| Refresh Google tokens | *(internal, called by other functions)* | Same — raw tokens never on client. |
+| Accept proposal | `proposal-action` | Triggers server-owned finalization. Must validate pending_actor. |
+| Counter proposal | `proposal-action` | Must validate pending_actor, create version + action atomically, flip pending_actor. |
+| Decline proposal | `proposal-action` | Must validate pending_actor. |
+| Withdraw proposal | `proposal-action` | Must validate partnership membership. |
+| Finalize (write to GCals) | `proposal-action` *(internal)* | Server-only. Writes to external Google Calendar API. Manages partial failure. |
+| Retry finalize | `proposal-action` | Server-only. Re-attempts GCal writes. |
+| Cancel event | `cancel-event` | Deletes from external Google Calendar API. Manages partial failure. |
+| Retry cancel | `cancel-event` | Re-attempts failed GCal deletes. |
+
+### Operations that go through Postgres RPC (security definer)
+
+| Operation | RPC Function | Why RPC, not direct insert |
+|-----------|-------------|---------------------------|
+| Create proposal | `create_proposal` | Atomic insert across 3 tables (proposals + proposal_versions + proposal_actions). Computes pending_actor_id. |
+| Join partnership | `join_partnership` | Must validate invite code, check user not already in partnership, set partner_b + status atomically. |
+
+### Operations the client does directly (via Supabase SDK with user JWT)
+
+| Operation | Table | RLS Policy |
+|-----------|-------|------------|
+| Update own profile | `profiles` | UPDATE where `id = auth.uid()` |
+| Create partnership | `partnerships` | INSERT where `partner_a_id = auth.uid()` |
+| Disconnect Google Calendar | `google_calendar_connections` | DELETE where `profile_id = auth.uid()` |
+
+### Operations that NEVER happen from any client path
+
+| Operation | Table | Why |
+|-----------|-------|-----|
+| Direct insert into `proposals` | `proposals` | Goes through `create_proposal` RPC. |
+| Direct insert into `proposal_versions` | `proposal_versions` | Goes through `create_proposal` RPC or `proposal-action` Edge Function. |
+| Direct insert into `proposal_actions` | `proposal_actions` | Goes through `create_proposal` RPC or `proposal-action` Edge Function. |
+| Any update to `proposal_versions` | `proposal_versions` | Immutable. No update policy exists. |
+| Any update to `proposal_actions` | `proposal_actions` | Immutable. No update policy exists. |
+| Any delete on `proposal_versions` | `proposal_versions` | Append-only. No delete policy exists. |
+| Any delete on `proposal_actions` | `proposal_actions` | Append-only. No delete policy exists. |
+| Direct insert/update on `calendar_events` | `calendar_events` | Only written by Edge Functions after GCal API calls. |
+| Direct insert/update on `google_calendar_connections` | `google_calendar_connections` | Only written by `google-auth-callback` Edge Function. |
+| Update `proposals.status` directly | `proposals` | Only changed by `proposal-action` or `cancel-event` Edge Functions. |
+
+---
+
+## Appendix C: RLS Strategy by Table
+
+| Table | SELECT | INSERT | UPDATE | DELETE | Notes |
+|-------|--------|--------|--------|--------|-------|
+| `profiles` | Own row + partner's row | *(trigger on auth.users)* | Own row only | Never | Partner read via partnership join. No client insert — auto-created by trigger. |
+| `partnerships` | Own partnerships + pending (for invite code lookup) | Own row as partner_a | Never (client) | Never | Join is via `join_partnership` RPC (security definer). |
+| `google_calendar_connections` | Own row | Never (client) | Never (client) | Own row (disconnect) | All writes via `google-auth-callback` Edge Function (service_role). |
+| `proposals` | Partnership members | Never (client) | Never (client) | Never | Created via `create_proposal` RPC. Updated via `proposal-action` Edge Function. |
+| `proposal_versions` | Partnership members | Never (client) | Never | Never | Created via `create_proposal` RPC or `proposal-action` Edge Function. Immutable. |
+| `proposal_actions` | Partnership members | Never (client) | Never | Never | Created via `create_proposal` RPC or `proposal-action` Edge Function. Immutable. |
+| `calendar_events` | Partnership members | Never (client) | Never (client) | Never (client) | All writes via Edge Functions (service_role). |
+
+**"Never (client)"** means no RLS policy exists for that operation. The table has RLS enabled, so the operation is denied by default.
+
+**"Never"** (without qualifier) means no policy exists AND the operation is architecturally forbidden — no server-side code does it either (immutable tables).
+
+---
+
+## Appendix D: Mutation Path Map
+
+### Confirmed: The mobile app writes directly to exactly 3 tables for exactly 3 operations
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     MOBILE APP (Supabase SDK)                    │
+│                                                                  │
+│   Direct writes (user JWT + RLS):                                │
+│   ┌─────────────────────────────────────────────────────────┐    │
+│   │ 1. profiles          → UPDATE own display_name/avatar   │    │
+│   │ 2. partnerships      → INSERT (create new partnership)  │    │
+│   │ 3. google_cal_conns  → DELETE (disconnect calendar)     │    │
+│   └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│   RPC calls (user JWT → security definer function):              │
+│   ┌─────────────────────────────────────────────────────────┐    │
+│   │ 4. create_proposal   → inserts into proposals,          │    │
+│   │                        proposal_versions,                │    │
+│   │                        proposal_actions                  │    │
+│   │ 5. join_partnership   → updates partnerships             │    │
+│   └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│   Edge Function calls (user JWT → service_role internally):      │
+│   ┌─────────────────────────────────────────────────────────┐    │
+│   │ 6. google-auth-callback → google_calendar_connections    │    │
+│   │ 7. proposal-action      → proposals, proposal_versions, │    │
+│   │                           proposal_actions,              │    │
+│   │                           calendar_events                │    │
+│   │ 8. cancel-event         → proposals, proposal_actions,   │    │
+│   │                           calendar_events                │    │
+│   │ 9. generate-slots       → (read-only, no DB writes)     │    │
+│   │ 10. check-conflicts     → (read-only, no DB writes)     │    │
+│   └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│   Read-only queries (user JWT + RLS):                            │
+│   ┌─────────────────────────────────────────────────────────┐    │
+│   │ All SELECT queries: proposals, versions, actions,        │    │
+│   │ calendar_events, profiles, partnerships,                 │    │
+│   │ google_calendar_connections (own row)                     │    │
+│   └─────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Total mutation paths: 10
+
+| # | Path | Mechanism | Tables touched |
+|---|------|-----------|---------------|
+| 1 | Update profile | Direct SDK (RLS) | `profiles` |
+| 2 | Create partnership | Direct SDK (RLS) | `partnerships` |
+| 3 | Disconnect calendar | Direct SDK (RLS) | `google_calendar_connections` |
+| 4 | Create proposal | Postgres RPC | `proposals`, `proposal_versions`, `proposal_actions` |
+| 5 | Join partnership | Postgres RPC | `partnerships` |
+| 6 | Connect Google Calendar | Edge Function | `google_calendar_connections` |
+| 7 | Proposal action (accept/counter/decline/withdraw/retry) | Edge Function | `proposals`, `proposal_versions`, `proposal_actions`, `calendar_events` |
+| 8 | Cancel event | Edge Function | `proposals`, `proposal_actions`, `calendar_events` |
+| 9 | Generate slots | Edge Function | *(none — read-only)* |
+| 10 | Check conflicts | Edge Function | *(none — read-only)* |
+
+**No table has more than one way to be mutated by the client.** The only exception is `partnerships`, which has two paths (create via direct insert, join via RPC) — these are different operations on different columns and cannot conflict.
+
+### The rule
+
+> The mobile app can write to `profiles`, `partnerships`, and `google_calendar_connections` directly (3 specific operations). Everything else — every proposal, every version, every action, every calendar event — goes through a Postgres RPC or Edge Function that validates, enforces the state machine, and executes atomically.
