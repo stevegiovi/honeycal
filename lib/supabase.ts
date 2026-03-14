@@ -1,16 +1,13 @@
 import "react-native-url-polyfill/auto";
 import { createClient } from "@supabase/supabase-js";
 import { Platform } from "react-native";
-import Constants from "expo-constants";
 
 const supabaseUrl =
-  Constants.expoConfig?.extra?.supabaseUrl ??
   process.env.EXPO_PUBLIC_SUPABASE_URL ??
-  "https://placeholder.supabase.co";
+  "https://kztgynpugldjgowtvthv.supabase.co";
 const supabaseAnonKey =
-  Constants.expoConfig?.extra?.supabaseAnonKey ??
   process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ??
-  "placeholder-anon-key";
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt6dGd5bnB1Z2xkamdvd3R2dGh2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMzODExNDEsImV4cCI6MjA4ODk1NzE0MX0.6sFd0nUygzuk3JTHX85kJMEQfwhA8vUNgeYa-b-Sh7c";
 
 // SecureStore is not available on web — use localStorage fallback
 const storageAdapter =
